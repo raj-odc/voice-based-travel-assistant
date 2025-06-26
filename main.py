@@ -34,112 +34,76 @@ class ConversationManager:
         self.stream_sid = stream_sid
         self.is_speaking = False # To prevent interruption
 
- 
     async def handle_response(self, text: str):
         if self.is_speaking:
             print("[DEBUG] AI is already speaking, ignoring new request.")
             return
         
         self.is_speaking = True
-        print(f"--- STARTING AI RESPONSE ---")
+        print(f"--- STARTING AI RESPONSE (Final Pattern) ---")
         print(f"1. AI Text: '{text}'")
 
-        # Step 1: Generate high-quality MP3 audio from ElevenLabs
         try:
-            print("2. Calling ElevenLabs to generate MP3 audio stream...")
-            # audio_stream = elevenlabs_client.generate(
-            #     text=text,
-            #     voice="Rachel",
-            #     model="eleven_turbo_v2",
-            #     stream=True
-            # )
+            print("2. Calling ElevenLabs for 8kHz mu-law audio...")
             audio_stream = elevenlabs_client.text_to_speech.stream(
                 text=text,
-                voice_id="21m00Tcm4TlvDq8ikWAM",  # Adam - a pre-made voice
-                model_id="eleven_turbo_v2"
+                voice_id="21m00Tcm4TlvDq8ikWAM",
+                model_id="eleven_turbo_v2",
+                output_format="ulaw_8000"
             )
             print("3. ElevenLabs stream received.")
-        except Exception as e:
-            print(f"[ERROR] ElevenLabs API call failed: {e}")
-            self.is_speaking = False
-            return
 
-        # Step 2: Collect the MP3 audio chunks into a single byte string
-        try:
-            print("4. Collecting MP3 audio chunks into memory...")
-            mp3_data = b"".join([chunk for chunk in audio_stream])
-            print(f"5. MP3 audio collected. Total size: {len(mp3_data)} bytes.")
-            if len(mp3_data) == 0:
-                print("[ERROR] MP3 data from ElevenLabs is empty. Aborting.")
-                self.is_speaking = False
-                return
-        except Exception as e:
-            print(f"[ERROR] Failed to collect audio chunks: {e}")
-            self.is_speaking = False
-            return
+            # --- THE ROBUST, PERMANENT FIX ---
+            # Get the current asyncio event loop and create an iterator
+            loop = asyncio.get_running_loop()
+            stream_iterator = iter(audio_stream)
 
-        # Step 3: Use pydub to convert the audio format in memory
-        try:
-            print("6. Starting pydub conversion: MP3 -> 8kHz mu-law...")
-            # Load the MP3 data from memory
-            audio_segment = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
-            print("7. pydub loaded MP3 data from memory.")
+            # Define a wrapper function to handle the blocking part
+            def get_next_chunk():
+                try:
+                    # This is the blocking call
+                    return next(stream_iterator)
+                except StopIteration:
+                    # Return None when the generator is exhausted
+                    return None
 
-            # Set the frame rate to 8000Hz (required for Twilio)
-            resampled_audio = audio_segment.set_frame_rate(8000)
-            print("8. pydub resampled audio to 8000Hz.")
-            
-            # Export as mu-law format
-            output_bytes = resampled_audio.export(format="mulaw").read()
-            print(f"9. pydub exported audio to mu-law. Total size: {len(output_bytes)} bytes.")
-
-        except Exception as e:
-            print(f"[ERROR] Pydub conversion failed: {e}")
-            self.is_speaking = False
-            return
-            
-        # Step 4: Send the converted mu-law audio back to Twilio
-        try:
-            print(f"10. Preparing to send {len(output_bytes)} bytes of audio to Twilio in chunks...")
-            chunk_size = 2048 # Send in 2KB chunks
-            total_chunks = (len(output_bytes) + chunk_size - 1) // chunk_size
-            
-            for i in range(0, len(output_bytes), chunk_size):
-                chunk_num = (i // chunk_size) + 1
-                chunk = output_bytes[i:i + chunk_size]
+            print("4. Streaming non-blocking chunks to Twilio...")
+            chunk_count = 0
+            while True:
+                # Run the wrapper function in a background thread
+                chunk = await loop.run_in_executor(None, get_next_chunk)
                 
-                # This log can be very noisy, so it's commented out by default
-                # print(f"   - Sending chunk {chunk_num}/{total_chunks} ({len(chunk)} bytes)")
-                
+                # If the chunk is None, the stream is finished
+                if chunk is None:
+                    break
+
+                chunk_count += 1
                 media_message = {
                     "event": "media",
                     "streamSid": self.stream_sid,
-                    "media": {
-                        "payload": base64.b64encode(chunk).decode('utf-8')
-                    }
+                    "media": {"payload": base64.b64encode(chunk).decode('utf-8')}
                 }
                 await self.websocket.send_text(json.dumps(media_message))
+                
+                # Pacing is still a good idea for stability
+                await asyncio.sleep(0.01)
             
-            print(f"11. All {total_chunks} chunks sent to Twilio successfully.")
-        except Exception as e:
-            print(f"[ERROR] Failed to send audio chunk to Twilio: {e}")
-            self.is_speaking = False
-            return
+            print(f"5. All {chunk_count} chunks sent successfully.")
 
-        # Step 5: Send a "mark" message to signal the end of speech
-        try:
             mark_message = {
                 "event": "mark",
                 "streamSid": self.stream_sid,
-                "mark": { "name": "ai_speech_ended" }
+                "mark": {"name": "ai_speech_ended"}
             }
             await self.websocket.send_text(json.dumps(mark_message))
-            print("12. 'Mark' message sent to Twilio.")
-        except Exception as e:
-            print(f"[ERROR] Failed to send 'mark' message to Twilio: {e}")
+            print("6. 'Mark' message sent.")
 
-        self.is_speaking = False
-        print("--- AI RESPONSE COMPLETE ---")
+        except Exception as e:
+            print(f"[ERROR] During AI response generation/streaming: {e}")
+
+        finally:
+            self.is_speaking = False
+            print("--- AI RESPONSE COMPLETE ---")
 
 # --- WEBSOCKET ENDPOINT ---
 @app.websocket("/ws")
@@ -189,7 +153,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"Twilio stream started with SID: {stream_sid}")
 
             elif event == 'media':
-                await dg_connection.send(base64.b64decode(data['media']['payload']))
+                if not conversation_manager.is_speaking:
+                  await dg_connection.send(base64.b64decode(data['media']['payload']))
+                # await dg_connection.send(base64.b64decode(data['media']['payload']))
 
             elif event == 'stop':
                 print("--- Twilio 'stop' event received. Call has ended. ---")
