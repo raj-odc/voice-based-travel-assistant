@@ -5,8 +5,6 @@ import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from openai import OpenAI
-
-
 from deepgram import (
     DeepgramClient,
     DeepgramClientOptions,
@@ -50,7 +48,37 @@ async def get_deepgram_connection():
             sentence = result.channel.alternatives[0].transcript
             if len(sentence) == 0:
                 return
+            
             print(f"User: {sentence}")
+
+            # --- THIS IS THE NEW PART ---
+            # Check if the transcript is final
+            if result.is_final:
+                print(f"Final transcript received: '{sentence}'. Sending to OpenAI...")
+                
+                try:
+                    # Call OpenAI's chat completion API
+                    chat_completion = client.chat.completions.create(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You are a friendly and helpful AI assistant. Keep your responses short and conversational.",
+                            },
+                            {
+                                "role": "user",
+                                "content": sentence,
+                            },
+                        ],
+                        model="gpt-3.5-turbo", # Use gpt-4o for better quality
+                    )
+                    
+                    ai_response = chat_completion.choices[0].message.content
+                    print(f"AI Response: {ai_response}")
+                    
+                    # For now, we just print the response. We'll add the voice in the next step.
+
+                except Exception as e:
+                    print(f"Error calling OpenAI: {e}")
 
         async def on_error(self, error, **kwargs):
             print(f"Deepgram Error: {error}")
