@@ -45,6 +45,7 @@ class ConversationManager:
 
         try:
             print("2. Calling ElevenLabs for 8kHz mu-law audio...")
+            # This returns a BLOCKING generator, which is the source of all our complexity
             audio_stream = elevenlabs_client.text_to_speech.stream(
                 text=text,
                 voice_id="21m00Tcm4TlvDq8ikWAM",
@@ -53,27 +54,24 @@ class ConversationManager:
             )
             print("3. ElevenLabs stream received.")
 
-            # --- THE ROBUST, PERMANENT FIX ---
-            # Get the current asyncio event loop and create an iterator
+            # This is the correct, non-blocking pattern to handle a blocking generator in asyncio
             loop = asyncio.get_running_loop()
             stream_iterator = iter(audio_stream)
 
-            # Define a wrapper function to handle the blocking part
+            # Wrapper function to safely get the next chunk in a separate thread
             def get_next_chunk():
                 try:
-                    # This is the blocking call
                     return next(stream_iterator)
                 except StopIteration:
-                    # Return None when the generator is exhausted
                     return None
 
-            print("4. Streaming non-blocking chunks to Twilio...")
+            print("4. Streaming non-blocking, paced chunks to Twilio...")
             chunk_count = 0
             while True:
-                # Run the wrapper function in a background thread
+                # Run the blocking call in the executor
                 chunk = await loop.run_in_executor(None, get_next_chunk)
                 
-                # If the chunk is None, the stream is finished
+                # Stop when the generator is exhausted
                 if chunk is None:
                     break
 
@@ -85,11 +83,12 @@ class ConversationManager:
                 }
                 await self.websocket.send_text(json.dumps(media_message))
                 
-                # Pacing is still a good idea for stability
-                await asyncio.sleep(0.01)
+                # Pacing the stream is crucial for stability with Twilio
+                await asyncio.sleep(0.02) # Increased sleep slightly for more stability
             
             print(f"5. All {chunk_count} chunks sent successfully.")
 
+            # Send the mark message to signal the end of the TTS
             mark_message = {
                 "event": "mark",
                 "streamSid": self.stream_sid,
